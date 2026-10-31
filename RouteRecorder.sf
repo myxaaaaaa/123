@@ -1,0 +1,264 @@
+// ============================================================================
+// RouteRecorder.sf  —  SAMPFUNCS (JS)
+// Запись маршрута от точки А до точки Б: ставит точку каждые ~3 метра пути.
+// Формат файла полностью совместим с автопилотом AutoTaxi (routes/Routes.pack):
+//   {"routes":[{"name":"...","points":[[x,y,z,gear,steer,heading,dist,hb],...],"loop":false}]}
+//
+// Управление в игре:
+//   F7  — начать запись (нужно находиться в транспортном средстве)
+//   F8  — остановить запись и сохранить
+//   F9  — удалить последнюю точку (во время записи)
+//   F6  — показать статус / количество маршрутов в чат
+//
+// Как работает запись:
+//   Точка А = стартовая позиция. Далее "хвостовая" точка идёт за машиной
+//   (переписывается каждой выборкой), а новая фиксированная точка создаётся,
+//   когда от неё пройдено >= minDist метров. Итог: интер между точками
+//   всегда ~3 м независимо от скорости. На высокой скорости (> maxDist за
+//   выборку) отрезок разбивается на равные шаги, плотность остаётся ровной.
+//   При F8 маршрут добавляется в Routes.pack как Route_N ( autopilot
+//   подхватывает его через /aproute <имя>).
+// ============================================================================
+
+const CONFIG = {
+    routesFile: 'AutoTaxi/routes/Routes.pack',   // относительно папки GTA SA
+    backupFile: 'AutoTaxi/routes/Routes.backup.json',
+    minDist: 3.0,     // метры между точками (3..5)
+    maxDist: 5.0,     // больше этого за одну выборку -> дробить отрезок на шаги
+    sampleMs: 50,     // частота опроса позиции
+};
+
+// ---------------------------------------------------------------------------
+// Состояние записи
+var recording = false;
+var recPoints = [];   // точки формата Routes.pack: [x,y,z,gear,steer,heading,dist,hb]
+var lastFixed = null; // последняя ФИКСИРОВАННАЯ точка {x,y,z} (от неё меряем minDist)
+var traveled = 0;     // накопленное расстояние по маршруту, м
+
+// ---------------------------------------------------------------------------
+// Утилиты
+function distXY(ax, ay, bx, by) {
+    var dx = bx - ax, dy = by - ay;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// нормализация угла в [0, 360)
+function normAng(a) {
+    a = a % 360;
+    if (a < 0) a += 360;
+    return a;
+}
+
+// курс по вектору скорости (SA: atan2(y,x) + 90 градусов)
+function headingFromVec(vx, vy) {
+    return normAng(Math.atan2(vy, vx) * 180 / Math.PI + 90);
+}
+
+function round2(v) { return Math.round(v * 100) / 100; }
+function round3(v) { return Math.round(v * 1000) / 1000; }
+
+function getCarHandleSafe() {
+    try { return getCharCarHandle(getPlayerId()); } catch (e) { return null; }
+}
+
+function getCarPosSafe() {
+    try { return getCharCarPosition(getPlayerId()); } catch (e) { return null; }
+}
+
+// Читаем курс и угол руля. heading — из вектора скорости машины (как это
+// делает сам автопилот при движении), steer — из CPhysical+0x48C, если доступно.
+// Если что-то не читается — fallback на предыдущее значение.
+function getSteerAndHeading() {
+    var car = getCarHandleSafe();
+    var heading = 0, steer = 0;
+    if (car) {
+        try {
+            var v = getCarSpeedVector(car);
+            if (Math.abs(v.x) + Math.abs(v.y) > 0.1) heading = headingFromVec(v.x, v.y);
+        } catch (e) {}
+        try {
+            // CPhysical+0x48C — steeringSpeed (float, радианы).
+            // Сторонние сборки SAMPFUNCS могут не иметь readMemoryFloat — тогда просто 0.
+            if (typeof readMemoryFloat === 'function') {
+                var st = readMemoryFloat(car + 0x48C);
+                if (isFinite(st)) steer = st;
+            }
+        } catch (e) {}
+    }
+    if (!heading && recPoints.length) heading = recPoints[recPoints.length - 1][5];
+    return { steer: round3(steer), heading: round2(heading) };
+}
+
+// Скорость машины, км/ч (для диагностики)
+function getCarKmh() {
+    var car = getCarHandleSafe();
+    if (!car) return 0;
+    try {
+        var v = getCarSpeedVector(car);
+        return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) * 3.6;
+    } catch (e) { return 0; }
+}
+
+// ---------------------------------------------------------------------------
+// Точка формата Routes.pack: [x, y, z, gear, steer, heading, dist, hb]
+//   gear   — передача (пишем 0, автопилот подбирает сам)
+//   steer  — угол руля, радианы (как в исходных маршрутах)
+//   heading— курс машины, градусы [0..360)
+//   dist   — накопленное расстояние вдоль маршрута, метры
+//   hb     — ручник (1/0)
+function makePoint(x, y, z, sh, dist, hb) {
+    return [round2(x), round2(y), round2(z), 0, sh.steer, sh.heading, round2(dist), hb ? 1 : 0];
+}
+
+// ---------------------------------------------------------------------------
+// Основной цикл записи (поток)
+function recordLoop() {
+    var prev = { x: lastFixed.x, y: lastFixed.y, z: lastFixed.z }; // позиция на прошлой выборке
+    while (recording) {
+        wait(CONFIG.sampleMs);
+        if (!isCharInAnyCar(getPlayerId())) continue;
+        var pos = getCarPosSafe();
+        if (!pos) continue;
+
+        var cur = { x: pos.x, y: pos.y, z: pos.z };
+        var step = distXY(prev.x, prev.y, cur.x, cur.y);
+        if (step < 0.05) continue;             // стоим на месте — ничего не меняем
+        if (step > 25) { prev = cur; continue; } // телепорт/вылет — игнорируем скачок
+
+        traveled += step;
+        var sh = getSteerAndHeading();
+        var hb = false;
+        try { hb = isKeysPressed(VK_SHIFT); } catch (e) {}
+
+        // расстояние от последней ФИКСИРОВАННОЙ точки до текущей позиции
+        var d = distXY(lastFixed.x, lastFixed.y, cur.x, cur.y);
+
+        if (d >= CONFIG.minDist) {
+            // новая опорная точка каждые minDist метров (на высокой скорости
+            // отрезок разбивается на равные шаги, плотность остаётся ~minDist)
+            var n = Math.max(1, Math.round(d / CONFIG.minDist));
+            for (var i = 1; i <= n; i++) {
+                var t = i / n;
+                pushFixed(lerp(lastFixed.x, cur.x, t), lerp(lastFixed.y, cur.y, t),
+                          lerp(lastFixed.z, cur.z, t), sh, traveled, hb);
+            }
+        } else {
+            // "хвост": последняя точка идёт за машиной, пока не наберём minDist
+            var tail = recPoints[recPoints.length - 1];
+            tail[0] = round2(cur.x); tail[1] = round2(cur.y); tail[2] = round2(cur.z);
+            tail[4] = sh.steer; tail[5] = sh.heading; tail[6] = round2(traveled);
+            tail[7] = hb ? 1 : 0;
+        }
+        prev = cur;
+    }
+}
+
+function pushFixed(x, y, z, sh, dist, hb) {
+    recPoints.push(makePoint(x, y, z, sh, dist, hb));
+    lastFixed = { x: x, y: y, z: z };
+}
+
+// ---------------------------------------------------------------------------
+// Чтение / запись Routes.pack
+function readRoutesPack() {
+    var obj = null;
+    try {
+        if (fileExists(CONFIG.routesFile)) {
+            var txt = loadFileAsString(CONFIG.routesFile);
+            obj = JSON.parse(txt);
+        }
+    } catch (e) {
+        print('[Recorder] Не удалось прочитать Routes.pack: ' + e);
+    }
+    if (!obj || !obj.routes || !(obj.routes instanceof Array)) obj = { routes: [] };
+    return obj;
+}
+
+function writeRoutesPack(obj) {
+    // бэкап перед перезаписью
+    try {
+        if (fileExists(CONFIG.routesFile)) copyFile(CONFIG.routesFile, CONFIG.backupFile);
+    } catch (e) {}
+    var jsonStr = JSON.stringify(obj);
+    saveBufferToFile(jsonStr, jsonStr.length, CONFIG.routesFile, 0);
+}
+
+function nextRouteName(obj) {
+    var maxN = 0;
+    for (var i = 0; i < obj.routes.length; i++) {
+        var m = /^Route_(\d+)$/.exec(obj.routes[i].name);
+        if (m && +m[1] > maxN) maxN = +m[1];
+    }
+    return 'Route_' + (maxN + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Старт / стоп
+function startRecording() {
+    if (recording) { chatPost('[Recorder] Запись уже идёт.'); return; }
+    if (!isCharInAnyCar(getPlayerId())) { chatPost('[Recorder] Сядь в машину и повтори F7.'); return; }
+    var pos = getCarPosSafe();
+    if (!pos) { chatPost('[Recorder] Не удалось получить позицию.'); return; }
+
+    recPoints = [];
+    traveled = 0;
+    recording = true;
+    lastFixed = { x: pos.x, y: pos.y, z: pos.z };
+    var sh = getSteerAndHeading();
+    pushFixed(pos.x, pos.y, pos.z, sh, 0, false); // точка А
+    createThread(recordLoop);
+    chatPost('[Recorder] Запись начата (точка А: ' + round2(pos.x) + ', ' + round2(pos.y) + '). F8 — стоп+сохранить.');
+}
+
+function stopRecording() {
+    if (!recording) { chatPost('[Recorder] Запись не идёт.'); return; }
+    recording = false; // поток recordLoop завершится на следующей итерации;
+                       // дальше save работает с уже собранным массивом точек
+    if (recPoints.length < 2) { chatPost('[Recorder] Слишком короткий маршрут (< 2 точек), не сохраняю.'); return; }
+
+    var obj = readRoutesPack();
+    var name = nextRouteName(obj);
+    obj.routes.push({ name: name, points: recPoints, loop: false });
+    writeRoutesPack(obj);
+
+    chatPost('[Recorder] Сохранено "' + name + '": ' + recPoints.length +
+             ' точек, ~' + round2(traveled) + ' м. Запуск автопилотом: /aproute ' + name);
+    print('[Recorder] Saved route ' + name + ', ' + recPoints.length + ' pts, ' + round2(traveled) + ' m');
+}
+
+// ---------------------------------------------------------------------------
+// Основной поток: горячие клавиши + статус
+main(function() {
+    print('RouteRecorder loaded');
+    chatPost('[Recorder] F7 — старт записи, F8 — стоп+сохранить, F9 — убрать последнюю точку, F6 — статус.');
+
+    while (true) {
+        wait(50);
+
+        if (isKeyDown(VK_F7)) { startRecording(); while (isKeyDown(VK_F7)) wait(30); }
+        if (isKeyDown(VK_F8)) { stopRecording();  while (isKeyDown(VK_F8)) wait(30); }
+        if (isKeyDown(VK_F9)) {
+            if (recording && recPoints.length > 1) {
+                recPoints.pop();
+                var lp = recPoints[recPoints.length - 1];
+                lastFixed = { x: lp[0], y: lp[1], z: lp[2] };
+                traveled = lp[6];
+                chatPost('[Recorder] Последняя точка удалена. Всего: ' + recPoints.length);
+            }
+            while (isKeyDown(VK_F9)) wait(30);
+        }
+        if (isKeyDown(VK_F6)) {
+            if (recording) {
+                chatPost('[Recorder] Идёт запись: ' + recPoints.length + ' точек, ~' + round2(traveled) +
+                         ' м, скорость ~' + Math.round(getCarKmh()) + ' км/ч.');
+            } else {
+                var obj = readRoutesPack();
+                var last = obj.routes.length ? obj.routes[obj.routes.length - 1].name : '(нет)';
+                chatPost('[Recorder] Не записываю. Маршрутов в файле: ' + obj.routes.length + ', последний: ' + last);
+            }
+            while (isKeyDown(VK_F6)) wait(30);
+        }
+    }
+});
